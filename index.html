@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive INT8 Quantization Visualizer</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-100 min-h-screen p-6 font-sans">
+
+    <div class="max-w-7xl mx-auto">
+        <header class="mb-8 border-b border-slate-800 pb-4">
+            <h1 class="text-3xl font-extrabold text-indigo-400">INT8 Quantization Dashboard</h1>
+            <p class="text-slate-400 mt-1">Simulating FP32 activation mapping, mathematical dynamic range boundaries, and information loss (MSE).</p>
+        </header>
+
+        <div class="grid grid-cols-1 lg:grid-cols-4 gap-8">
+            
+            <div class="lg:col-span-1 bg-slate-800 p-6 rounded-xl border border-slate-700 h-fit space-y-6">
+                <h2 class="text-xl font-bold text-slate-200">Quantization Config</h2>
+                
+                <div>
+                    <label class="block text-sm font-semibold text-slate-400 mb-2">Quantization Strategy</label>
+                    <div class="flex bg-slate-950 p-1 rounded-lg border border-slate-700">
+                        <button id="btnAsym" onclick="setMode('asymmetric')" class="flex-1 text-center py-1.5 rounded-md text-sm font-medium bg-indigo-600 text-white transition-all cursor-pointer">Asymmetric</button>
+                        <button id="btnSym" onclick="setMode('symmetric')" class="flex-1 text-center py-1.5 rounded-md text-sm font-medium text-slate-400 hover:text-slate-200 transition-all cursor-pointer">Symmetric</button>
+                    </div>
+                </div>
+
+                <div>
+                    <div class="flex justify-between items-center mb-1">
+                        <label class="text-sm font-semibold text-slate-400">Scale ($S$)</label>
+                        <span id="valS" class="text-sm font-mono text-indigo-400 font-bold">0.0650</span>
+                    </div>
+                    <input id="slideS" type="range" min="0.01" max="0.3" step="0.0005" value="0.065" oninput="updateQuantization()" class="w-full h-2 bg-slate-950 rounded-lg appearance-none cursor-pointer accent-indigo-500">
+                </div>
+
+                <div>
+                    <div class="flex justify-between items-center mb-1">
+                        <label class="text-sm font-semibold text-slate-400">Zero-Point ($Z$)</label>
+                        <span id="valZ" class="text-sm font-mono text-indigo-400 font-bold">0</span>
+                    </div>
+                    <input id="slideZ" type="range" min="-128" max="127" step="1" value="0" oninput="updateQuantization()" class="w-full h-2 bg-slate-950 rounded-lg appearance-none cursor-pointer accent-indigo-500">
+                </div>
+
+                <div class="bg-slate-950 p-4 rounded-lg border border-slate-700 space-y-3">
+                    <div>
+                        <span class="block text-xs font-bold uppercase text-slate-500 tracking-wider">Quantization Error (MSE)</span>
+                        <span id="metricMSE" class="text-xl font-mono font-bold text-emerald-400">0.0000</span>
+                    </div>
+                    <div>
+                        <span class="block text-xs font-bold uppercase text-slate-500 tracking-wider">Clipped Outliers</span>
+                        <span id="metricClip" class="text-xl font-mono font-bold text-rose-400">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="lg:col-span-3 grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col">
+                    <h3 class="text-md font-bold text-slate-300 mb-2">FP32 Space vs. Information Loss</h3>
+                    <div class="relative flex-1 min-h-[350px]">
+                        <canvas id="chartFP32"></canvas>
+                    </div>
+                </div>
+                <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col">
+                    <h3 class="text-md font-bold text-slate-300 mb-2">Hardware Register Space (Discrete INT8 Bins)</h3>
+                    <div class="relative flex-1 min-h-[350px]">
+                        <canvas id="chartINT8"></canvas>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <script>
+        let mode = 'asymmetric';
+        let fp32Data = [];
+        let chartFP32Instance, chartINT8Instance;
+
+        // Initialize continuous mock data pipeline (Normal distribution + synthetic outlier features)
+        function generateMockData() {
+            const data = [];
+            // Clean baseline distributions
+            for (let i = 0; i < 800; i++) {
+                data.push(gaussianRandom(2.0, 1.2));
+            }
+            // Extreme activation outliers
+            for (let i = 0; i < 60; i++) {
+                data.push((Math.random() * 16) - 8);
+            }
+            return data.sort((a, b) => a - b);
+        }
+
+        function gaussianRandom(mean, std) {
+            let u = 0, v = 0;
+            while(u === 0) u = Math.random(); 
+            while(v === 0) v = Math.random();
+            return mean + std * Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+        }
+
+        // Analytical metrics tracking & quantization core math
+        function processQuantization(data, S, Z) {
+            let clippedCount = 0;
+            let squaredErrorSum = 0;
+            
+            const int8Histogram = new Array(256).fill(0); // Bins for [-128 to 127]
+            const dequantizedValues = [];
+
+            data.forEach(x => {
+                // Formula: q = round(x/S) + Z
+                let q = Math.round(x / S) + Z;
+                
+                // Track dynamic hardware clipping
+                if (q > 127) { q = 127; clippedCount++; }
+                else if (q < -128) { q = -128; clippedCount++; }
+
+                // Map to 0-255 indexing for histogram rendering array
+                int8Histogram[q + 128]++;
+
+                // De-quantize back to floating approximation: x_hat = S * (q - Z)
+                const xHat = S * (q - Z);
+                dequantizedValues.push(xHat);
+
+                squaredErrorSum += Math.pow(x - xHat, 2);
+            });
+
+            return {
+                mse: squaredErrorSum / data.length,
+                clipped: clippedCount,
+                histINT8: int8Histogram,
+                dequant: dequantizedValues
+            };
+        }
+
+        function setMode(newMode) {
+            mode = newMode;
+            const btnAsym = document.getElementById('btnAsym');
+            const btnSym = document.getElementById('btnSym');
+            const slideZ = document.getElementById('slideZ');
+
+            if (mode === 'symmetric') {
+                btnSym.className = "flex-1 text-center py-1.5 rounded-md text-sm font-medium bg-indigo-600 text-white transition-all cursor-pointer";
+                btnAsym.className = "flex-1 text-center py-1.5 rounded-md text-sm font-medium text-slate-400 hover:text-slate-200 transition-all cursor-pointer";
+                slideZ.value = 0;
+                slideZ.disabled = true;
+            } else {
+                btnAsym.className = "flex-1 text-center py-1.5 rounded-md text-sm font-medium bg-indigo-600 text-white transition-all cursor-pointer";
+                btnSym.className = "flex-1 text-center py-1.5 rounded-md text-sm font-medium text-slate-400 hover:text-slate-200 transition-all cursor-pointer";
+                slideZ.disabled = false;
+            }
+            updateQuantization();
+        }
+
+        // Histogram packaging for Chart.js parsing
+        function bucketData(values, min, max, totalBuckets) {
+            const step = (max - min) / totalBuckets;
+            const counts = new Array(totalBuckets).fill(0);
+            const labels = [];
+            for(let i=0; i<totalBuckets; i++) {
+                labels.push((min + (i * step) + (step/2)).toFixed(2));
+            }
+            values.forEach(v => {
+                let idx = Math.floor((v - min) / step);
+                if(idx >= totalBuckets) idx = totalBuckets - 1;
+                if(idx < 0) idx = 0;
+                counts[idx]++;
+            });
+            return { labels, counts };
+        }
+
+        function updateQuantization() {
+            const S = parseFloat(document.getElementById('slideS').value);
+            const Z = mode === 'symmetric' ? 0 : parseInt(document.getElementById('slideZ').value);
+
+            document.getElementById('valS').innerText = S.toFixed(4);
+            document.getElementById('valZ').innerText = Z;
+
+            const results = processQuantization(fp32Data, S, Z);
+
+            document.getElementById('metricMSE').innerText = results.mse.toFixed(4);
+            document.getElementById('metricClip').innerText = results.clipped;
+
+            // Generate structural metrics for continuous vs step chart
+            const originalBuckets = bucketData(fp32Data, -8, 8, 40);
+            const dequantBuckets = bucketData(results.dequant, -8, 8, 40);
+
+            // Calculate current execution boundaries for the background markers
+            const upperClipBoundary = S * (127 - Z);
+            const lowerClipBoundary = S * (-128 - Z);
+
+            // Update FP32 Graph
+            chartFP32Instance.data.labels = originalBuckets.labels;
+            chartFP32Instance.data.datasets[0].data = originalBuckets.counts;
+            chartFP32Instance.data.datasets[1].data = dequantBuckets.counts;
+            
+            // Draw visual clipping plugin markers
+            chartFP32Instance.options.plugins.annotation = {
+                annotations: {
+                    lineMin: { type: 'line', xMin: lowerClipBoundary, xMax: lowerClipBoundary, scaleID: 'x', borderColor: 'rgba(244, 63, 94, 0.7)', borderWidth: 2, borderDash: [6, 6] },
+                    lineMax: { type: 'line', xMin: upperClipBoundary, xMax: upperClipBoundary, scaleID: 'x', borderColor: 'rgba(244, 63, 94, 0.7)', borderWidth: 2, borderDash: [6, 6] }
+                }
+            };
+            chartFP32Instance.update('none');
+
+            // Update INT8 Graph
+            chartINT8Instance.data.datasets[0].data = results.histINT8;
+            
+            // Set dynamic background highlight colors to map hardware boundaries
+            const bgColors = new Array(256).fill('rgba(129, 140, 248, 0.5)');
+            bgColors[0] = 'rgba(244, 63, 94, 0.8)';   // Highlight -128 clip floor
+            bgColors[255] = 'rgba(244, 63, 94, 0.8)'; // Highlight 127 clip ceiling
+            chartINT8Instance.data.datasets[0].backgroundColor = bgColors;
+            
+            chartINT8Instance.update('none');
+        }
+
+        // Initialize Graph Components on Page Load
+        window.onload = function() {
+            fp32Data = generateMockData();
+
+            const ctxFP32 = document.getElementById('chartFP32').getContext('20d');
+            chartFP32Instance = new Chart(ctxFP32, {
+                type: 'bar',
+                data: {
+                    labels: [],
+                    datasets: [
+                        { label: 'Original FP32', data: [], backgroundColor: 'rgba(59, 130, 246, 0.4)', borderColor: '#3b82f6', borderWidth: 1, barPercentage: 1.0, categoryPercentage: 1.0 },
+                        { label: 'Dequantized Estimate', data: [], backgroundColor: 'rgba(245, 158, 11, 0.4)', borderColor: '#f59e0b', borderWidth: 1, barPercentage: 0.8, categoryPercentage: 0.8 }
+                    ]
+                },
+                options: { responsive: true, maintainAspectRatio: false, scales: { x: { grid: { color: '#334155' } }, y: { grid: { color: '#334155' } } } }
+            });
+
+            const labelsINT8 = [];
+            for (let i = -128; i <= 127; i++) labelsINT8.push(i);
+
+            const ctxINT8 = document.getElementById('chartINT8').getContext('20d');
+            chartINT8Instance = new Chart(ctxINT8, {
+                type: 'bar',
+                data: {
+                    labels: labelsINT8,
+                    datasets: [{ label: 'Register Bins Counts', data: [], backgroundColor: [], barPercentage: 1.0, categoryPercentage: 1.0 }]
+                },
+                options: { responsive: true, maintainAspectRatio: false, scales: { x: { grid: { display: false }, ticks: { callback: function(val, index) { return index % 32 === 0 ? labelsINT8[index] : ''; } } }, y: { grid: { color: '#334155' } } } }
+            });
+
+            // Calculate starting default positions derived closely from standard deviation parameters
+            const dataMax = Math.max(...fp32Data);
+            const dataMin = Math.min(...fp32Data);
+            const defaultS = (dataMax - dataMin) / 255;
+            document.getElementById('slideS').value = defaultS;
+            document.getElementById('slideZ').value = Math.round(-dataMin / defaultS) - 128;
+
+            updateQuantization();
+        };
+    </script>
+</body>
+</html>

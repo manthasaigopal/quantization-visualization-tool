@@ -2,7 +2,7 @@
 
 An interactive, local-first web dashboard designed to visualize how high-precision neural network weights and activations (`FP32`) are mapped into hardware-efficient 8-bit integers (`INT8`). 
 
-**[👉 Live Interactive Dashboard]((https://github.com/manthasaigopal/quantization-visualization-tool/))**
+**[👉 Live Interactive Dashboard](https://manthasaigopal/quantization-visualization-tool/)**
 
 
 ## 🚀 Overview
